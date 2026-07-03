@@ -1,0 +1,44 @@
+# Compiled binaries / build output
+/bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+amparo
+sca
+
+# Go test/build artifacts
+*.test
+*.out
+coverage.txt
+coverage.html
+
+# Go workspace files (local dev only)
+go.work
+go.work.sum
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Local environment / secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Local database data (if running Postgres outside Docker)
+/pgdata/
+*.sqlite
+*.sqlite3
+
+# OS junk
+desktop.ini
+ehthumbs.db

@@ -1,0 +1,6 @@
+golang.org/x/crypto v0.17.0 h1:aaaaaaa
+golang.org/x/crypto v0.17.0/go.mod h1:bbbbbbb
+golang.org/x/net v0.17.0 h1:ccccccc
+github.com/gin-gonic/gin v1.7.0 h1:ddddddd
+# a comment
+gopkg.in/yaml.v3 v3.0.1 h1:eeeeeee

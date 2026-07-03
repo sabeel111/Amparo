@@ -1,0 +1,14 @@
+[[package]]
+name = "django"
+version = "3.2.0"
+category = "main"
+
+[[package]]
+name = "requests"
+version = "2.27.0"
+category = "main"
+
+[[package]]
+name = "pyyaml"
+version = "5.3.1"
+category = "main"

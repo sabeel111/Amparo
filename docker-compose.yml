@@ -1,0 +1,24 @@
+# Development Postgres for the SCA platform.
+# Start: docker compose up -d
+# Stop:  docker compose down
+# Reset: docker compose down -v
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: sca-postgres
+    environment:
+      POSTGRES_USER: sca
+      POSTGRES_PASSWORD: sca
+      POSTGRES_DB: sca
+    ports:
+      - "5432:5432"
+    volumes:
+      - sca-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sca -d sca"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  sca-pgdata:
