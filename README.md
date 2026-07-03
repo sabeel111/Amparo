@@ -13,7 +13,7 @@ remediation.
 
 [![Go](https://img.shields.io/badge/Go-1.22+-00ADD8?logo=go&logoColor=white)](https://go.dev)
 [![Postgres](https://img.shields.io/badge/Postgres-16-4169E1?logo=postgresql&logoColor=white)](https://www.postgresql.org)
-[![License](https://img.shields.io/badge/license-TBD-lightgrey)](#license)
+[![License](https://img.shields.io/badge/license-Apache_2.0-blue)](LICENSE)
 [![Status](https://img.shields.io/badge/status-alpha-orange)](#project-status)
 
 </div>
@@ -536,9 +536,16 @@ phased roadmap.
 
 ## 📄 License
 
-License TBD. Currently all rights reserved pending a decision on open-core vs.
-proprietary. See [Roadmap](#-roadmap) and the design doc for the business-model
-discussion.
+Amparo is licensed under the **[Apache License 2.0](LICENSE)**.
+
+**Open-core model:** the scanning engine, local OSV sync, persistence, and
+prioritization are open-source under Apache 2.0 — matching the licensing of
+osv-scanner, Trivy, and Grype, which keeps adoption friction low for security
+teams. Future commercial layers (hosted dashboard, AI features, enterprise SSO/RBAC,
+policies) may be licensed separately.
+
+Contributions are accepted under the same Apache 2.0 license (see the license's
+§5). A CLA is not currently required for individual contributors.
 
 ---
 
