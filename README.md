@@ -22,7 +22,6 @@ remediation.
 
 ## 📖 Table of contents
 
-- [Why Amparo exists](#-why-amparo-exists)
 - [What it does](#-what-it-does)
 - [The continuity differentiator](#-the-continuity-differentiator)
 - [Quick start](#-quick-start)
@@ -39,38 +38,6 @@ remediation.
 - [Roadmap](#-roadmap)
 - [Documentation](#-documentation)
 - [License](#-license)
-
----
-
-## 🎯 Why Amparo exists
-
-Every modern application is mostly someone else's code. A typical project pulls
-in hundreds — often thousands — of open-source dependencies, and each one is a
-potential attack surface. Supply-chain attacks are now one of the most common
-and damaging vectors in the wild.
-
-The problem isn't *finding* vulnerabilities — tools like Dependabot, Snyk, and
-Trivy will happily list hundreds of "matches." The problem is **signal vs.
-noise**: a critical CVSS score on a function your code never calls is a
-distraction; a "medium" CVE that's being actively exploited is an emergency.
-
-Amparo is built on three principles that cut through that noise:
-
-1. **Prioritization that earns trust.** Raw CVSS is useless on its own. Amparo
-   combines CVSS + EPSS (exploit probability) + fix-availability +
-   direct-vs-transitive into one auditable score, and tells you *why* it scored
-   something the way it did.
-2. **True continuity.** Dependencies rarely change — but the vulnerability
-   landscape does, daily. Amparo stores your resolved dependency graph once and
-   re-matches it against an evolving vuln database, so a CVE that drops today
-   alerts on code you committed months ago, **without rescanning**.
-3. **A remediation path, not just an alert.** "Upgrade to X" is table stakes.
-   Amparo picks the minimal fixed version that respects your constraints and
-   classifies the risk (a patch bump is safe; a major bump might break things).
-
-> **Note:** Amparo is in **alpha**. The engine is correct and validated against
-> real data, but it is not yet a complete product — see
-> [Project status](#-project-status--known-limitations).
 
 ---
 
@@ -91,6 +58,10 @@ Given a lockfile (or a directory of them), Amparo:
 6. **Persists** (optionally) the snapshot + findings to Postgres, with
    finding-lifecycle dedup so the same issue across rescans is one record.
 7. **Reports** as a readable text summary or structured JSON.
+
+> **Note:** Amparo is in **alpha**. The engine is correct and validated against
+> real data, but it is not yet a complete product — see
+> [Project status](#-project-status--known-limitations).
 
 ---
 
