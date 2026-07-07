@@ -154,7 +154,12 @@ func (s *Store) UpsertVuln(ctx context.Context, v VulnRow) error {
 		toJson(v.FixedVersions), v.Affected, v.Ecosystem,
 		v.EPSSProbability, v.EPSSPercentile, v.InKEV,
 		v.WithdrawnAt, v.Published, v.Modified)
-	return err
+	if err != nil {
+		return err
+	}
+	// Keep the vuln_package index in sync so FindVulnsByPackage (which reads the
+	// index, not the JSONB) returns this record.
+	return s.ReindexVulnPackages(ctx, []string{v.OSVID})
 }
 
 // BulkUpsertVulns upserts many vuln records efficiently using COPY into a temp
@@ -247,24 +252,55 @@ func (s *Store) BulkUpsertVulns(ctx context.Context, rows []VulnRow) error {
 }
 
 // FindVulnsByPackage returns all non-withdrawn vulns for an ecosystem+package.
-// Used by the local matcher to find candidate records before range-evaluation.
+// Uses the normalized vuln_package index (migration 003) for an index-backed
+// JOIN instead of a JSONB containment scan — the difference between milliseconds
+// and a full-table scan at scale.
 func (s *Store) FindVulnsByPackage(ctx context.Context, ecosystem, name string) ([]VulnRow, error) {
-	// affected is a JSON array; we filter with a containment check on the
-	// package name. Range evaluation happens in Go (per ecosystem comparator).
 	rows, err := s.Pool.Query(ctx, `
-		SELECT osv_id, aliases, summary, severity_score, cvss_vectors,
-		       fixed_versions, affected, ecosystem,
-		       epss_probability, epss_percentile, in_kev,
-		       withdrawn_at, published, modified
-		FROM vuln_record
-		WHERE ecosystem = $1 AND withdrawn_at IS NULL
-		  AND affected @> $2::jsonb`,
-		ecosystem, fmt.Sprintf(`[{"package":{"name":%q}}]`, name))
+		SELECT v.osv_id, v.aliases, v.summary, v.severity_score, v.cvss_vectors,
+		       v.fixed_versions, v.affected, v.ecosystem,
+		       v.epss_probability, v.epss_percentile, v.in_kev,
+		       v.withdrawn_at, v.published, v.modified
+		FROM vuln_package vp
+		JOIN vuln_record v ON v.osv_id = vp.vuln_id
+		WHERE vp.ecosystem = $1 AND vp.name = $2 AND v.withdrawn_at IS NULL`,
+		ecosystem, name)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	return collectVulns(rows)
+}
+
+// ReindexVulnPackages rebuilds the vuln_package index rows for the given vuln
+// IDs. Called by the sync worker after each batch upsert so the index stays in
+// sync with the affected[] data without a full rebuild.
+func (s *Store) ReindexVulnPackages(ctx context.Context, vulnIDs []string) error {
+	if len(vulnIDs) == 0 {
+		return nil
+	}
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	// Delete existing index rows for these vulns, then re-insert from affected[].
+	// This handles removed/renamed packages correctly on update.
+	if _, err := tx.Exec(ctx,
+		`DELETE FROM vuln_package WHERE vuln_id = ANY($1)`, vulnIDs); err != nil {
+		return fmt.Errorf("reindex delete: %w", err)
+	}
+
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO vuln_package (ecosystem, name, vuln_id)
+		SELECT v.ecosystem, aff -> 'package' ->> 'name', v.osv_id
+		FROM vuln_record v, jsonb_array_elements(v.affected) AS aff
+		WHERE v.osv_id = ANY($1) AND aff -> 'package' ->> 'name' IS NOT NULL
+		ON CONFLICT (ecosystem, name, vuln_id) DO NOTHING`, vulnIDs); err != nil {
+		return fmt.Errorf("reindex insert: %w", err)
+	}
+	return tx.Commit(ctx)
 }
 
 // ChangedVulnsSince returns vuln_ids whose modified timestamp is after t.
@@ -285,6 +321,55 @@ func (s *Store) ChangedVulnsSince(ctx context.Context, t time.Time) ([]string, e
 		ids = append(ids, id)
 	}
 	return ids, rows.Err()
+}
+
+// DepRowWithProject is a dependency plus its owning project — the shape the
+// continuity worker needs to re-match stored deps against changed vulns and
+// re-persist findings under the right project/snapshot.
+type DepRowWithProject struct {
+	DepRow
+	ProjectID  int64
+	SnapshotID int64
+}
+
+// DepsAffectedByVulns returns stored dependencies whose (ecosystem, name) is
+// named in ANY of the given vuln IDs' affected packages. This is the continuity
+// candidate set: only these deps could newly match a changed vuln, so we avoid
+// re-scanning the entire dependency graph.
+//
+// Joins: vuln_package (changed vulns) → dependency (stored deps) on
+// (ecosystem, name). This is index-backed and cheap.
+func (s *Store) DepsAffectedByVulns(ctx context.Context, vulnIDs []string) ([]DepRowWithProject, error) {
+	if len(vulnIDs) == 0 {
+		return nil, nil
+	}
+	// We normalize ecosystems: deps store internal names (npm, PyPI, Go, cargo);
+	// vuln_package stores OSV bucket names (npm, PyPI, Go, crates.io). Cargo is
+	// the only mismatch, so we bridge it in the JOIN condition.
+	rows, err := s.Pool.Query(ctx, `
+		SELECT DISTINCT d.snapshot_id, d.purl, d.name, d.version, d.ecosystem,
+		                 d.scope, d.is_direct, snap.project_id
+		FROM dependency d
+		JOIN snapshot snap ON snap.id = d.snapshot_id
+		JOIN vuln_package vp ON
+		      (vp.ecosystem = d.ecosystem
+		       OR (vp.ecosystem = 'crates.io' AND d.ecosystem = 'cargo'))
+		  AND vp.name = d.name
+		WHERE vp.vuln_id = ANY($1)`, vulnIDs)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []DepRowWithProject
+	for rows.Next() {
+		var r DepRowWithProject
+		if err := rows.Scan(&r.SnapshotID, &r.Purl, &r.Name, &r.Version,
+			&r.Ecosystem, &r.Scope, &r.IsDirect, &r.ProjectID); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
 }
 
 // UpsertFinding inserts a finding or, if the (project, purl, version, vuln)

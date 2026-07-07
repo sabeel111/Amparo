@@ -171,9 +171,18 @@ func downloadAndStore(ctx context.Context, st *store.Store, eco model.Ecosystem,
 		if len(batch) == 0 {
 			return nil
 		}
+		// Collect the vuln IDs before consuming the batch for reindexing.
+		ids := make([]string, len(batch))
+		for i, r := range batch {
+			ids[i] = r.OSVID
+		}
 		if err := st.BulkUpsertVulns(ctx, batch); err != nil {
 			return err
 		}
+		// Keep the normalized vuln_package index in sync so lookups are fast.
+		// Non-fatal: a failed reindex leaves the index slightly stale; the
+		// matcher falls back to whatever rows ARE indexed.
+		_ = st.ReindexVulnPackages(ctx, ids)
 		count += len(batch)
 		batch = batch[:0]
 		return nil
