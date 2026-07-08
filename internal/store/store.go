@@ -442,6 +442,210 @@ func (s *Store) CloseSnapshotFindings(ctx context.Context, projectID, snapshotID
 	return tag.RowsAffected(), nil
 }
 
+// --- Dashboard queries (used by the HTTP API in internal/server) ---
+
+// ProjectRow is a project with aggregated finding counts, for the project list.
+type ProjectRow struct {
+	ID             int64
+	OrgName        string
+	Name           string
+	TotalFindings  int
+	OpenFindings   int
+	CriticalCount  int
+	HighCount      int
+	MediumCount    int
+	LowCount       int
+	LastScanned    *time.Time // most recent snapshot.created_at
+}
+
+// ListProjects returns all projects with aggregated finding counts. Uses GROUP
+// BY aggregation rather than pulling rows in-memory.
+func (s *Store) ListProjects(ctx context.Context) ([]ProjectRow, error) {
+	rows, err := s.Pool.Query(ctx, `
+		SELECT p.id, o.name, p.name,
+		       COUNT(f.id) AS total,
+		       COUNT(f.id) FILTER (WHERE f.status IN ('new','triaged')) AS open,
+		       COUNT(f.id) FILTER (WHERE f.priority='critical' AND f.status IN ('new','triaged')) AS crit,
+		       COUNT(f.id) FILTER (WHERE f.priority='high' AND f.status IN ('new','triaged')) AS high,
+		       COUNT(f.id) FILTER (WHERE f.priority='medium' AND f.status IN ('new','triaged')) AS med,
+		       COUNT(f.id) FILTER (WHERE f.priority='low' AND f.status IN ('new','triaged')) AS low,
+		       MAX(snap.created_at) AS last_scanned
+		FROM project p
+		JOIN organization o ON o.id = p.org_id
+		LEFT JOIN finding f ON f.project_id = p.id
+		LEFT JOIN snapshot snap ON snap.id = (
+		    SELECT id FROM snapshot WHERE project_id = p.id ORDER BY created_at DESC LIMIT 1)
+		GROUP BY p.id, o.name, p.name
+		ORDER BY (COUNT(f.id) FILTER (WHERE f.status IN ('new','triaged'))) DESC, p.name`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ProjectRow
+	for rows.Next() {
+		var p ProjectRow
+		if err := rows.Scan(&p.ID, &p.OrgName, &p.Name, &p.TotalFindings,
+			&p.OpenFindings, &p.CriticalCount, &p.HighCount,
+			&p.MediumCount, &p.LowCount, &p.LastScanned); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+// ProjectSummaryRow is the severity/status breakdown for one project.
+type ProjectSummaryRow struct {
+	Total      int
+	Critical   int
+	High       int
+	Medium     int
+	Low        int
+	Open       int
+	Fixed      int
+	Direct     int
+	Transitive int
+	Exploited  int // EPSS percentile >= 0.95 (the "act now" signal)
+}
+
+// ProjectSummary computes the dashboard summary for a project via SQL GROUP BY.
+// "Open" = status new|triaged (not yet fixed/suppressed).
+func (s *Store) ProjectSummary(ctx context.Context, projectID int64) (ProjectSummaryRow, error) {
+	var ps ProjectSummaryRow
+	err := s.Pool.QueryRow(ctx, `
+		SELECT
+		  COUNT(*),
+		  COUNT(*) FILTER (WHERE priority='critical'),
+		  COUNT(*) FILTER (WHERE priority='high'),
+		  COUNT(*) FILTER (WHERE priority='medium'),
+		  COUNT(*) FILTER (WHERE priority='low'),
+		  COUNT(*) FILTER (WHERE status IN ('new','triaged')),
+		  COUNT(*) FILTER (WHERE status='fixed'),
+		  COUNT(*) FILTER (WHERE is_direct AND status IN ('new','triaged')),
+		  COUNT(*) FILTER (WHERE NOT is_direct AND status IN ('new','triaged')),
+		  COUNT(*) FILTER (WHERE epss_percentile >= 0.95 AND status IN ('new','triaged'))
+		FROM finding WHERE project_id=$1`, projectID).Scan(
+		&ps.Total, &ps.Critical, &ps.High, &ps.Medium, &ps.Low,
+		&ps.Open, &ps.Fixed, &ps.Direct, &ps.Transitive, &ps.Exploited)
+	return ps, err
+}
+
+// FindingFilters controls the findings-list query for the dashboard.
+type FindingFilters struct {
+	Status    string // "open" (new|triaged), "fixed", "suppressed", "" (all)
+	Severity  string // critical|high|medium|low, "" = all
+	Ecosystem string // npm|PyPI|Go|cargo, "" = all
+	OnlyEPSS  bool   // only EPSS percentile >= 0.95
+	Query     string // free-text on package name / vuln id
+	Limit     int    // 0 = default 200
+}
+
+// DetailedFinding is a FindingRow enriched with the vuln record's summary,
+// aliases, and fixed versions — the shape the dashboard needs. Populated via a
+// JOIN on vuln_record.
+type DetailedFinding struct {
+	FindingRow
+	Summary       string   `json:"summary"`
+	Aliases       []string `json:"aliases"`
+	FixedVersions []string `json:"fixed_versions"`
+}
+
+// FindingsByProjectDetailed is like FindingsByProject but JOINs vuln_record so
+// each finding carries its advisory summary, aliases, and fixed versions.
+// Supports the dashboard filters. Index-backed: uses idx_finding_project_status
+// and the vuln_record PK.
+func (s *Store) FindingsByProjectDetailed(ctx context.Context, projectID int64, f FindingFilters) ([]DetailedFinding, error) {
+	q := `
+		SELECT f.id, f.project_id, f.snapshot_id, f.dependency_purl,
+		       f.dependency_name, f.dependency_version, f.dependency_ecosystem,
+		       f.is_direct, f.vuln_id, f.cvss, f.epss_probability, f.epss_percentile,
+		       f.priority, f.actionable, f.status, f.first_seen, f.last_seen,
+		       COALESCE(v.summary, ''), COALESCE(v.aliases, '[]'), COALESCE(v.fixed_versions, '[]')
+		FROM finding f
+		LEFT JOIN vuln_record v ON v.osv_id = f.vuln_id
+		WHERE f.project_id = $1`
+	args := []any{projectID}
+	n := 2
+	if f.Status == "open" {
+		q += fmt.Sprintf(` AND f.status IN ('new','triaged')`)
+	} else if f.Status != "" {
+		q += fmt.Sprintf(` AND f.status = $%d`, n)
+		args = append(args, f.Status)
+		n++
+	}
+	if f.Severity != "" {
+		q += fmt.Sprintf(` AND f.priority = $%d`, n)
+		args = append(args, f.Severity)
+		n++
+	}
+	if f.Ecosystem != "" {
+		q += fmt.Sprintf(` AND f.dependency_ecosystem = $%d`, n)
+		args = append(args, normalizeEcosystem(f.Ecosystem))
+		n++
+	}
+	if f.OnlyEPSS {
+		q += ` AND f.epss_percentile >= 0.95`
+	}
+	if f.Query != "" {
+		q += fmt.Sprintf(` AND (f.dependency_name ILIKE $%d OR f.vuln_id ILIKE $%d)`, n, n)
+		args = append(args, "%"+f.Query+"%")
+		n++
+	}
+	q += ` ORDER BY CASE f.priority WHEN 'critical' THEN 4 WHEN 'high' THEN 3
+	          WHEN 'medium' THEN 2 WHEN 'low' THEN 1 ELSE 0 END DESC,
+	          f.epss_percentile DESC NULLS LAST, f.last_seen DESC`
+	limit := f.Limit
+	if limit <= 0 {
+		limit = 200
+	}
+	q += fmt.Sprintf(` LIMIT %d`, limit)
+
+	rows, err := s.Pool.Query(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []DetailedFinding
+	for rows.Next() {
+		var d DetailedFinding
+		if err := rows.Scan(&d.ID, &d.ProjectID, &d.SnapshotID, &d.DependencyPurl,
+			&d.DependencyName, &d.DependencyVersion, &d.DependencyEcosystem,
+			&d.IsDirect, &d.VulnID, &d.CVSS, &d.EPSSProbability, &d.EPSSPercentile,
+			&d.Priority, &d.Actionable, &d.Status, &d.FirstSeen, &d.LastSeen,
+			&d.Summary, &d.Aliases, &d.FixedVersions); err != nil {
+			return nil, err
+		}
+		out = append(out, d)
+	}
+	return out, rows.Err()
+}
+
+// UpdateFindingStatus sets a finding's status (triage/dismiss). Returns an error
+// if the finding doesn't exist.
+func (s *Store) UpdateFindingStatus(ctx context.Context, findingID int64, status string) error {
+	tag, err := s.Pool.Exec(ctx,
+		`UPDATE finding SET status=$1 WHERE id=$2`, status, findingID)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("finding %d not found", findingID)
+	}
+	return nil
+}
+
+// normalizeEcosystem maps UI-friendly names to the internal DB spellings.
+// The UI sends "npm"/"pypi"/"go"/"cargo"; the DB stores "npm"/"PyPI"/"Go"/"cargo".
+func normalizeEcosystem(s string) string {
+	switch s {
+	case "pypi":
+		return "PyPI"
+	case "go":
+		return "Go"
+	}
+	return s
+}
+
 // --- helpers ---
 
 func collectVulns(rows pgx.Rows) ([]VulnRow, error) {

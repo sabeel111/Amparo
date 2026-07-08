@@ -1,0 +1,101 @@
+@import "tailwindcss";
+
+/*
+ * Amparo design system — grayscale-dark (Socket-style).
+ * Thesis: color is a SCARCE signal. Neutrals everywhere; saturated color
+ * appears ONLY on the row needing action now (KEV / EPSS>=95). This defeats
+ * the "when everything is urgent, nothing is" anti-pattern.
+ */
+
+:root {
+  /* Canvas + surfaces (zinc scale — cool, professional) */
+  --background: #09090b;       /* zinc-950 — the canvas */
+  --surface: #111113;          /* panels, cards */
+  --surface-2: #18181b;        /* raised surface (table header, hover) */
+  --border: #27272a;           /* zinc-800 — subtle dividers */
+  --border-strong: #3f3f46;    /* zinc-700 — emphasis borders */
+
+  /* Text */
+  --foreground: #fafafa;       /* zinc-50 — primary */
+  --muted: #a1a1aa;            /* zinc-400 — secondary */
+  --subtle: #71717a;           /* zinc-500 — tertiary/labels */
+
+  /* Semantic (severity) — used SPARINGLY, only on badges/flags, not full rows */
+  --critical: #ef4444;         /* red-500 */
+  --high: #f97316;             /* orange-500 */
+  --medium: #f59e0b;           /* amber-500 */
+  --low: #71717a;              /* zinc-500 — NOT green (green implies "safe") */
+
+  /* Accent — the "act now" signal. Reserved for KEV/EPSS>=95. */
+  --accent: #ef4444;           /* red — exploit-likely flag */
+
+  /* Fonts */
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, "SF Mono", monospace;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-surface: var(--surface);
+  --color-surface-2: var(--surface-2);
+  --color-border: var(--border);
+  --color-border-strong: var(--border-strong);
+  --color-foreground: var(--foreground);
+  --color-muted: var(--muted);
+  --color-subtle: var(--subtle);
+  --color-critical: var(--critical);
+  --color-high: var(--high);
+  --color-medium: var(--medium);
+  --color-low: var(--low);
+  --color-accent: var(--accent);
+  --font-sans: var(--font-sans);
+  --font-mono: var(--font-mono);
+}
+
+* {
+  border-color: var(--border);
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+}
+
+/* Tabular figures for data columns (versions, CVE IDs, scores) — prevents jitter */
+.tnum {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Subtle, professional scrollbar (dark) */
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: var(--background); }
+::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 5px; }
+::-webkit-scrollbar-thumb:hover { background: var(--subtle); }
+
+/* Focus rings — visible per a11y rules, but on-brand (zinc, not blue) */
+:focus-visible {
+  outline: 2px solid var(--muted);
+  outline-offset: 2px;
+}
+
+/* Respect reduced motion */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* Skeleton shimmer for loading states (progressive-loading rule) */
+@keyframes shimmer {
+  0% { background-position: -1000px 0; }
+  100% { background-position: 1000px 0; }
+}
+.skeleton {
+  background: linear-gradient(90deg, var(--surface) 25%, var(--surface-2) 50%, var(--surface) 75%);
+  background-size: 1000px 100%;
+  animation: shimmer 2s infinite linear;
+}
