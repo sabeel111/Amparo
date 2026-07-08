@@ -82,6 +82,13 @@ func splitPreRelease(v string) (core, pre string) {
 }
 
 // SeverityFromCVSS maps a numeric CVSS score to a band.
+// SeverityFromCVSS maps a numeric CVSS score to a band.
+//
+// A score of 0 means "no CVSS vector was provided" (some OSV/GHSA records omit
+// it), NOT "not vulnerable." Since this is only called for matched findings, a
+// missing CVSS should never produce SeverityNone — that would create a confusing
+// "NONE" tier of real vulnerabilities. We floor unknown-CVSS findings at Low so
+// they're visible and triageable rather than disappearing into a meaningless band.
 func SeverityFromCVSS(score float64) Severity {
 	switch {
 	case score >= 9.0:
@@ -90,9 +97,9 @@ func SeverityFromCVSS(score float64) Severity {
 		return SeverityHigh
 	case score >= 4.0:
 		return SeverityMedium
-	case score > 0:
-		return SeverityLow
 	default:
-		return SeverityNone
+		// Covers score > 0 (Low) AND score == 0 (unknown — floored to Low so a
+		// matched vuln with no CVSS vector is still surfaced, never "none").
+		return SeverityLow
 	}
 }

@@ -42,7 +42,8 @@ func TestSeverityFromCVSS(t *testing.T) {
 		{6.9, SeverityMedium},
 		{4.0, SeverityMedium},
 		{3.9, SeverityLow},
-		{0, SeverityNone},
+		// CVSS 0 = unknown vector; matched findings floor at Low, never None.
+		{0, SeverityLow},
 	}
 	for _, c := range cases {
 		if got := SeverityFromCVSS(c.score); got != c.want {

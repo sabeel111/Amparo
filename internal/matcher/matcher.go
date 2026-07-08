@@ -9,6 +9,8 @@
 package matcher
 
 import (
+	"strings"
+
 	"github.com/sabeel111/Amparo/internal/model"
 	"github.com/sabeel111/Amparo/internal/osvclient"
 	pipparser "github.com/sabeel111/Amparo/internal/parser/pip"
@@ -57,6 +59,196 @@ func FindingsForDependency(dep model.Dependency, records []Record) []model.Findi
 		}
 	}
 	return out
+}
+
+// DedupeFindings collapses findings that describe the SAME vulnerability for the
+// SAME dependency version. OSV aggregates advisories from many sources (GHSA,
+// CVE, PYSEC, RUSTSEC…) and these cross-reference each other via aliases — so a
+// single real-world vuln often yields 2+ OSV records (one primary, others labeled
+// "Duplicate Advisory"). Without dedup the user sees the same issue twice.
+//
+// Rule: two findings are duplicates if they target the same (ecosystem, name,
+// version) AND share any identifier — either their vuln_id or any alias.
+// When collapsing, we keep the higher-priority one and merge aliases + fixed
+// versions so no information is lost. We prefer the record NOT prefixed with
+// "Duplicate Advisory" in its summary (OSV's convention for dupes).
+func DedupeFindings(findings []model.Finding) []model.Finding {
+	if len(findings) < 2 {
+		return findings
+	}
+	// Group by dependency identity. Findings for different packages are never
+	// duplicates of each other.
+	groups := map[string][]int{} // dependencyKey -> indices into findings
+	for i, f := range findings {
+		key := depKey(f.Dependency)
+		groups[key] = append(groups[key], i)
+	}
+
+	kept := make([]bool, len(findings))
+	out := make([]model.Finding, 0, len(findings))
+	for _, idxs := range groups {
+		// Within a dependency group, collapse by shared identifier.
+		var chain []int // indices forming one merged finding
+		used := map[int]bool{}
+
+		for _, i := range idxs {
+			if used[i] {
+				continue
+			}
+			chain = []int{i}
+			used[i] = true
+			// Collect all identifiers + summaries known so far in this chain.
+			ids := idSet(findings[i])
+			summaries := map[string]bool{stripDupPrefix(findings[i].Summary): true}
+			// Repeatedly scan for findings that share any id OR summary with the chain.
+			// The summary check catches OSV "Duplicate Advisory:" records that lack
+			// alias links (a known data quirk) — they only link via matching text.
+			changed := true
+			for changed {
+				changed = false
+				for _, j := range idxs {
+					if used[j] {
+						continue
+					}
+					match := sharesAny(ids, findings[j])
+					if !match {
+						// Try summary match against any chain member's summary.
+						// Catches OSV "Duplicate Advisory:" records lacking alias links.
+						js := stripDupPrefix(findings[j].Summary)
+						if js != "" && summaries[js] {
+							match = true
+						}
+					}
+					if match {
+						chain = append(chain, j)
+						used[j] = true
+						for k := range idSet(findings[j]) {
+							ids[k] = true
+						}
+						summaries[stripDupPrefix(findings[j].Summary)] = true
+						changed = true
+					}
+				}
+			}
+			out = append(out, mergeChain(findings, chain))
+		}
+	}
+	_ = kept
+	return out
+}
+
+// depKey is the grouping identity for a dependency (ecosystem+name+version).
+func depKey(d model.Dependency) string {
+	return string(d.Ecosystem) + "|" + d.Name + "@" + d.Version
+}
+
+// idSet returns the set of all identifiers (vuln_id + aliases) for a finding.
+func idSet(f model.Finding) map[string]bool {
+	out := map[string]bool{f.VulnID: true}
+	for _, a := range f.Aliases {
+		out[a] = true
+	}
+	return out
+}
+
+// sharesAny reports whether the finding overlaps the given id set, OR is a
+// "Duplicate Advisory" of something already in the chain.
+//
+// OSV's duplicate-advisory records sometimes carry NO aliases linking them to
+// the primary record (a known data quirk) — the only signal is a summary like
+// "Duplicate Advisory: <same text as the primary>". So in addition to the
+// alias-graph check, we detect dupes by: the finding's summary starts with
+// "Duplicate Advisory:" AND its tail content matches a chain member's summary.
+func sharesAny(ids map[string]bool, f model.Finding) bool {
+	if ids[f.VulnID] {
+		return true
+	}
+	for _, a := range f.Aliases {
+		if ids[a] {
+			return true
+		}
+	}
+	return false
+}
+
+// stripDupPrefix removes OSV's "Duplicate Advisory: " prefix so a duplicate
+// record's summary can be compared against the primary's summary text. OSV's
+// dup records sometimes lack alias links (a known data quirk), so summary text
+// is the only signal tying them to the primary record.
+func stripDupPrefix(s string) string {
+	const p = "Duplicate Advisory: "
+	if strings.HasPrefix(s, p) {
+		return strings.TrimSpace(strings.TrimPrefix(s, p))
+	}
+	return strings.TrimSpace(s)
+}
+
+// mergeChain picks the representative finding from a dup chain (highest priority,
+// non-"Duplicate Advisory" preferred) and merges aliases + fixed versions in.
+func mergeChain(findings []model.Finding, chain []int) model.Finding {
+	best := chain[0]
+	for _, i := range chain[1:] {
+		if prefer(findings[i], findings[best]) {
+			best = i
+		}
+	}
+	merged := findings[best]
+	seen := idSet(merged)
+	for _, i := range chain {
+		for _, a := range findings[i].Aliases {
+			if !seen[a] {
+				seen[a] = true
+				merged.Aliases = append(merged.Aliases, a)
+			}
+		}
+		for _, fv := range findings[i].FixedVersions {
+			if !contains(merged.FixedVersions, fv) {
+				merged.FixedVersions = append(merged.FixedVersions, fv)
+			}
+		}
+	}
+	return merged
+}
+
+// prefer reports whether a should be the representative over b.
+// Higher severity wins; ties broken by preferring the non-"Duplicate Advisory".
+func prefer(a, b model.Finding) bool {
+	if rank(a.Severity) != rank(b.Severity) {
+		return rank(a.Severity) > rank(b.Severity)
+	}
+	dupA := isDupAdvisory(a.Summary)
+	dupB := isDupAdvisory(b.Summary)
+	if dupA != dupB {
+		return !dupA // prefer the one that's NOT a duplicate
+	}
+	return false // keep existing on full tie
+}
+
+func isDupAdvisory(summary string) bool {
+	return strings.HasPrefix(summary, "Duplicate Advisory")
+}
+
+func rank(s model.Severity) int {
+	switch s {
+	case model.SeverityCritical:
+		return 4
+	case model.SeverityHigh:
+		return 3
+	case model.SeverityMedium:
+		return 2
+	case model.SeverityLow:
+		return 1
+	}
+	return 0
+}
+
+func contains(s []string, v string) bool {
+	for _, x := range s {
+		if x == v {
+			return true
+		}
+	}
+	return false
 }
 
 // buildFinding is the shared finding constructor. Returns nil if the record
