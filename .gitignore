@@ -39,6 +39,9 @@ Thumbs.db
 *.sqlite
 *.sqlite3
 
+# ZCode agent scratch directory
+.zcode/
+
 # OS junk
 desktop.ini
 ehthumbs.db
