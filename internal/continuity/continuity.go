@@ -18,12 +18,14 @@ package continuity
 import (
 	"context"
 	"fmt"
+	"io"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/sabeel111/Amparo/internal/matcher"
 	"github.com/sabeel111/Amparo/internal/model"
+	"github.com/sabeel111/Amparo/internal/scan"
 	"github.com/sabeel111/Amparo/internal/store"
 )
 
@@ -128,12 +130,17 @@ func rematch(ctx context.Context, st *store.Store, loc *matcher.LocalMatcher,
 		if err != nil {
 			return newF, updatedF, fmt.Errorf("continuity: rematch project %d: %w", k.project, err)
 		}
-		// Upsert each finding under its project/snapshot. Enrichment/prioritization
-		// would normally run here too; for the continuity path we apply EPSS-less
-		// prioritization (priority stays at the CVSS floor) — a future enhancement
-		// is to run the full pipeline. The finding lifecycle is preserved either way.
+
+		// Run the FULL enrichment pipeline (dedup → EPSS → prioritize → remediate)
+		// — the same path scan.Run uses — so continuity-discovered findings get
+		// identical treatment to scan-discovered ones. Previously these got only a
+		// CVSS-derived priority with no EPSS, composite scoring, or remediation,
+		// meaning the same advisory could show different risk data depending on
+		// how it was discovered.
+		findings = scan.EnrichFindings(ctx, io.Discard, findings)
+
+		// Upsert each enriched finding under its project/snapshot.
 		for _, f := range findings {
-			priority := f.Severity // CVSS-derived floor; full prioritizer runs on scan
 			row := store.FindingRow{
 				ProjectID:           k.project,
 				SnapshotID:          k.snapshot,
@@ -144,7 +151,9 @@ func rematch(ctx context.Context, st *store.Store, loc *matcher.LocalMatcher,
 				IsDirect:            f.Dependency.IsDirect,
 				VulnID:              f.VulnID,
 				CVSS:                float32(f.CVSS),
-				Priority:            string(priority),
+				EPSSProbability:     float32(f.EPSSProbability),
+				EPSSPercentile:      float32(f.EPSSPercentile),
+				Priority:            string(f.Priority),
 				Actionable:          actionableFor(f),
 			}
 			created, err := st.UpsertFinding(ctx, row)

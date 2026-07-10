@@ -139,23 +139,17 @@ func Run(ctx context.Context, pool *pgxpool.Pool, opts Options) (*Result, error)
 		}
 	}
 
-	// 3. Dedup cross-source advisory duplicates.
-	if before := len(findings); before > 0 {
+	// 3-5. Enrich: dedup → EPSS → prioritize → remediate.
+	// (Shared with continuity — both paths now produce identical findings.)
+	if opts.NoEPSS && len(findings) > 0 {
+		// EPSS skipped via flag: still dedup + prioritize + remediate, just no EPSS.
 		findings = matcher.DedupeFindings(findings)
-		if d := before - len(findings); d > 0 {
-			fmt.Fprintf(log, "amparo: deduplicated %d cross-source finding(s)\n", d)
+		findings = prioritize.Enrich(findings)
+		for i := range findings {
+			findings[i].Remediation = remediate.For(findings[i])
 		}
-	}
-
-	// 4. EPSS enrichment.
-	if !opts.NoEPSS && len(findings) > 0 {
-		enrichEPSS(ctx, log, findings)
-	}
-
-	// 5. Prioritize + remediate.
-	findings = prioritize.Enrich(findings)
-	for i := range findings {
-		findings[i].Remediation = remediate.For(findings[i])
+	} else {
+		findings = EnrichFindings(ctx, log, findings)
 	}
 
 	rep := report.Build(findings, len(deps))
