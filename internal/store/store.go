@@ -163,16 +163,16 @@ func (s *Store) UpsertVuln(ctx context.Context, v VulnRow) error {
 }
 
 // BulkUpsertVulns upserts many vuln records efficiently using COPY into a temp
-// table, then a single INSERT...ON CONFLICT. This is orders of magnitude faster
-// than per-record UpsertVuln for the OSV sync (which upserts tens of thousands
-// of records per ecosystem).
-func (s *Store) BulkUpsertVulns(ctx context.Context, rows []VulnRow) error {
+// table, then a single INSERT...ON CONFLICT. It returns exactly the IDs that
+// were inserted or materially changed, so callers can trigger continuity
+// without inferring change from advisory timestamps.
+func (s *Store) BulkUpsertVulns(ctx context.Context, rows []VulnRow) ([]string, error) {
 	if len(rows) == 0 {
-		return nil
+		return nil, nil
 	}
 	tx, err := s.Pool.Begin(ctx)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer tx.Rollback(ctx)
 
@@ -197,7 +197,7 @@ func (s *Store) BulkUpsertVulns(ctx context.Context, rows []VulnRow) error {
 			modified        TIMESTAMPTZ,
 			synced_at       TIMESTAMPTZ
 		) ON COMMIT DROP`); err != nil {
-		return fmt.Errorf("create temp: %w", err)
+		return nil, fmt.Errorf("create temp: %w", err)
 	}
 
 	_, err = tx.CopyFrom(ctx,
@@ -216,10 +216,10 @@ func (s *Store) BulkUpsertVulns(ctx context.Context, rows []VulnRow) error {
 			}, nil
 		}))
 	if err != nil {
-		return fmt.Errorf("copy: %w", err)
+		return nil, fmt.Errorf("copy: %w", err)
 	}
 
-	_, err = tx.Exec(ctx, `
+	changedRows, err := tx.Query(ctx, `
 		INSERT INTO vuln_record (
 			osv_id, aliases, summary, severity_score, cvss_vectors,
 			fixed_versions, affected, ecosystem,
@@ -244,11 +244,41 @@ func (s *Store) BulkUpsertVulns(ctx context.Context, rows []VulnRow) error {
 			withdrawn_at=EXCLUDED.withdrawn_at,
 			published=EXCLUDED.published,
 			modified=EXCLUDED.modified,
-			synced_at=now()`)
+			synced_at=now()
+		WHERE vuln_record.aliases IS DISTINCT FROM EXCLUDED.aliases
+		   OR vuln_record.summary IS DISTINCT FROM EXCLUDED.summary
+		   OR vuln_record.severity_score IS DISTINCT FROM EXCLUDED.severity_score
+		   OR vuln_record.cvss_vectors IS DISTINCT FROM EXCLUDED.cvss_vectors
+		   OR vuln_record.fixed_versions IS DISTINCT FROM EXCLUDED.fixed_versions
+		   OR vuln_record.affected IS DISTINCT FROM EXCLUDED.affected
+		   OR vuln_record.ecosystem IS DISTINCT FROM EXCLUDED.ecosystem
+		   OR vuln_record.epss_probability IS DISTINCT FROM EXCLUDED.epss_probability
+		   OR vuln_record.epss_percentile IS DISTINCT FROM EXCLUDED.epss_percentile
+		   OR vuln_record.in_kev IS DISTINCT FROM EXCLUDED.in_kev
+		   OR vuln_record.withdrawn_at IS DISTINCT FROM EXCLUDED.withdrawn_at
+		   OR vuln_record.published IS DISTINCT FROM EXCLUDED.published
+		   OR vuln_record.modified IS DISTINCT FROM EXCLUDED.modified
+		RETURNING osv_id`)
 	if err != nil {
-		return fmt.Errorf("upsert: %w", err)
+		return nil, fmt.Errorf("upsert: %w", err)
 	}
-	return tx.Commit(ctx)
+	defer changedRows.Close()
+
+	var changed []string
+	for changedRows.Next() {
+		var id string
+		if err := changedRows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("reading changed vulnerability ID: %w", err)
+		}
+		changed = append(changed, id)
+	}
+	if err := changedRows.Err(); err != nil {
+		return nil, fmt.Errorf("reading changed vulnerability IDs: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return changed, nil
 }
 
 // FindVulnsByPackage returns all non-withdrawn vulns for an ecosystem+package.
@@ -446,16 +476,16 @@ func (s *Store) CloseSnapshotFindings(ctx context.Context, projectID, snapshotID
 
 // ProjectRow is a project with aggregated finding counts, for the project list.
 type ProjectRow struct {
-	ID             int64
-	OrgName        string
-	Name           string
-	TotalFindings  int
-	OpenFindings   int
-	CriticalCount  int
-	HighCount      int
-	MediumCount    int
-	LowCount       int
-	LastScanned    *time.Time // most recent snapshot.created_at
+	ID            int64
+	OrgName       string
+	Name          string
+	TotalFindings int
+	OpenFindings  int
+	CriticalCount int
+	HighCount     int
+	MediumCount   int
+	LowCount      int
+	LastScanned   *time.Time // most recent snapshot.created_at
 }
 
 // ListProjects returns all projects with aggregated finding counts. Uses GROUP

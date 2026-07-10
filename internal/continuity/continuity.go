@@ -29,25 +29,36 @@ import (
 
 // Result reports what the continuity loop did.
 type Result struct {
-	ChangedVulns   int // vuln records that changed since the cutoff
-	CandidateDeps  int // stored deps potentially affected by those changes
-	NewFindings    int // findings newly created by this re-match
+	ChangedVulns    int // vuln records in the requested re-match set
+	CandidateDeps   int // stored deps potentially affected by those changes
+	NewFindings     int // findings newly created by this re-match
 	UpdatedFindings int // existing findings whose last_seen was bumped
-	Duration       time.Duration
+	Duration        time.Duration
 }
 
 // RunSince re-matches stored dependencies against vulns changed since `cutoff`.
-// This is the entry point the sync worker calls after each OSV update.
+// It remains available for manual maintenance runs. Sync uses RunForVulns so it
+// can pass the exact IDs that were inserted or changed.
 func RunSince(ctx context.Context, pool *pgxpool.Pool, cutoff time.Time) (Result, error) {
-	start := time.Now()
 	st := store.New(pool)
-	res := Result{}
-
-	// 1. What changed?
 	changed, err := st.ChangedVulnsSince(ctx, cutoff)
 	if err != nil {
-		return res, fmt.Errorf("continuity: changed vulns: %w", err)
+		return Result{}, fmt.Errorf("continuity: changed vulns: %w", err)
 	}
+	return runForVulns(ctx, pool, st, changed)
+}
+
+// RunForVulns re-matches stored dependencies against the exact OSV advisory IDs
+// changed by a completed sync. It avoids timestamp inference, which can miss an
+// advisory first imported today but last modified upstream weeks ago.
+func RunForVulns(ctx context.Context, pool *pgxpool.Pool, vulnIDs []string) (Result, error) {
+	return runForVulns(ctx, pool, store.New(pool), vulnIDs)
+}
+
+func runForVulns(ctx context.Context, pool *pgxpool.Pool, st *store.Store, vulnIDs []string) (Result, error) {
+	start := time.Now()
+	res := Result{}
+	changed := uniqueIDs(vulnIDs)
 	res.ChangedVulns = len(changed)
 	if len(changed) == 0 {
 		res.Duration = time.Since(start)
@@ -76,6 +87,18 @@ func RunSince(ctx context.Context, pool *pgxpool.Pool, cutoff time.Time) (Result
 	res.UpdatedFindings = updatedF
 	res.Duration = time.Since(start)
 	return res, nil
+}
+
+func uniqueIDs(ids []string) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if id != "" && !seen[id] {
+			seen[id] = true
+			out = append(out, id)
+		}
+	}
+	return out
 }
 
 // rematch runs the local matcher over the candidate deps and upserts findings,
@@ -112,17 +135,17 @@ func rematch(ctx context.Context, st *store.Store, loc *matcher.LocalMatcher,
 		for _, f := range findings {
 			priority := f.Severity // CVSS-derived floor; full prioritizer runs on scan
 			row := store.FindingRow{
-				ProjectID:          k.project,
-				SnapshotID:         k.snapshot,
-				DependencyPurl:     purlFor(f.Dependency),
-				DependencyName:     f.Dependency.Name,
-				DependencyVersion:  f.Dependency.Version,
+				ProjectID:           k.project,
+				SnapshotID:          k.snapshot,
+				DependencyPurl:      purlFor(f.Dependency),
+				DependencyName:      f.Dependency.Name,
+				DependencyVersion:   f.Dependency.Version,
 				DependencyEcosystem: string(f.Dependency.Ecosystem),
-				IsDirect:           f.Dependency.IsDirect,
-				VulnID:             f.VulnID,
-				CVSS:               float32(f.CVSS),
-				Priority:           string(priority),
-				Actionable:         actionableFor(f),
+				IsDirect:            f.Dependency.IsDirect,
+				VulnID:              f.VulnID,
+				CVSS:                float32(f.CVSS),
+				Priority:            string(priority),
+				Actionable:          actionableFor(f),
 			}
 			created, err := st.UpsertFinding(ctx, row)
 			if err != nil {

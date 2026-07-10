@@ -38,6 +38,7 @@ type Options struct {
 	MatchMode   string // "auto" | "local" | "live"
 	NoEPSS      bool
 	Persist     bool
+	Strict      bool // fail when any supported discovered lockfile cannot be read or parsed
 	Timeout     time.Duration
 	Log         io.Writer // progress logs (stderr for CLI, captured for webhooks)
 }
@@ -77,18 +78,31 @@ func Run(ctx context.Context, pool *pgxpool.Pool, opts Options) (*Result, error)
 	}
 	registry := parser.NewRegistry()
 	var deps []model.Dependency
+	coverage := report.Coverage{Complete: true, Discovered: len(files)}
 	for _, f := range files {
 		content, err := os.ReadFile(f)
 		if err != nil {
-			fmt.Fprintf(log, "warn: could not read %s: %v\n", f, err)
+			warning := fmt.Sprintf("could not read %s: %v", f, err)
+			fmt.Fprintf(log, "warn: %s\n", warning)
+			coverage.Complete = false
+			coverage.Failed++
+			coverage.Warnings = append(coverage.Warnings, warning)
 			continue
 		}
 		parsed, err := registry.ParseFile(f, content)
 		if err != nil {
-			fmt.Fprintf(log, "warn: could not parse %s: %v\n", f, err)
+			warning := fmt.Sprintf("could not parse %s: %v", f, err)
+			fmt.Fprintf(log, "warn: %s\n", warning)
+			coverage.Complete = false
+			coverage.Failed++
+			coverage.Warnings = append(coverage.Warnings, warning)
 			continue
 		}
+		coverage.Parsed++
 		deps = append(deps, parsed...)
+	}
+	if opts.Strict && !coverage.Complete {
+		return nil, fmt.Errorf("scan coverage incomplete: %d of %d supported lockfile(s) failed to parse", coverage.Failed, coverage.Discovered)
 	}
 	if len(deps) == 0 {
 		return nil, fmt.Errorf("no dependencies parsed from lockfiles")
@@ -145,6 +159,7 @@ func Run(ctx context.Context, pool *pgxpool.Pool, opts Options) (*Result, error)
 	}
 
 	rep := report.Build(findings, len(deps))
+	rep.Coverage = coverage
 	result := &Result{Report: rep}
 
 	// 6. Persist.

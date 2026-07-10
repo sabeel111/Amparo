@@ -120,6 +120,44 @@ func TestUpsertVulnAndFindByPackage(t *testing.T) {
 	s.Pool.Exec(ctx, `DELETE FROM vuln_record WHERE osv_id=$1`, v.OSVID)
 }
 
+func TestBulkUpsertVulns_ReturnsOnlyInsertedOrMateriallyChangedIDs(t *testing.T) {
+	ctx := context.Background()
+	s := dbConn(t)
+	defer s.Pool.Close()
+
+	uid := fmt.Sprintf("%d", time.Now().UnixNano())
+	v := VulnRow{
+		OSVID: "TEST-BULK-VULN-" + uid, Summary: "original summary",
+		Affected: []byte(`[]`), Ecosystem: "npm", Modified: time.Now().UTC().Add(-time.Hour),
+	}
+	defer s.Pool.Exec(ctx, `DELETE FROM vuln_record WHERE osv_id=$1`, v.OSVID)
+
+	changed, err := s.BulkUpsertVulns(ctx, []VulnRow{v})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(changed) != 1 || changed[0] != v.OSVID {
+		t.Fatalf("first bulk upsert changed IDs = %v, want [%s]", changed, v.OSVID)
+	}
+
+	changed, err = s.BulkUpsertVulns(ctx, []VulnRow{v})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(changed) != 0 {
+		t.Errorf("unchanged bulk upsert returned %v, want no changed IDs", changed)
+	}
+
+	v.Summary = "materially changed summary"
+	changed, err = s.BulkUpsertVulns(ctx, []VulnRow{v})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(changed) != 1 || changed[0] != v.OSVID {
+		t.Errorf("changed bulk upsert IDs = %v, want [%s]", changed, v.OSVID)
+	}
+}
+
 func TestUpsertFinding_DedupBumpsLastSeen(t *testing.T) {
 	ctx := context.Background()
 	s := dbConn(t)

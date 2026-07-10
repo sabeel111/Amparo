@@ -62,7 +62,7 @@ func TestContinuity_SurfacesNewFindingWithoutRescan(t *testing.T) {
 	affected, _ := json.Marshal([]map[string]any{{
 		"package": map[string]string{"name": pkgName, "ecosystem": "npm"},
 		"ranges": []map[string]any{{
-			"type": "SEMVER",
+			"type":   "SEMVER",
 			"events": []map[string]string{{"introduced": "0"}, {"fixed": "2.0.0"}},
 		}},
 	}})
@@ -76,6 +76,9 @@ func TestContinuity_SurfacesNewFindingWithoutRescan(t *testing.T) {
 		Ecosystem:     "npm",
 		Modified:      time.Now().UTC(), // NOW → counts as "changed since cutoff"
 	}
+	// An old upstream timestamp must not prevent a newly imported advisory from
+	// reaching existing snapshots when sync passes its exact advisory ID.
+	vuln.Modified = time.Now().UTC().AddDate(0, 0, -30)
 	if err := st.UpsertVuln(ctx, vuln); err != nil {
 		t.Fatal(err)
 	}
@@ -98,9 +101,9 @@ func TestContinuity_SurfacesNewFindingWithoutRescan(t *testing.T) {
 	}
 
 	// 4. Run continuity with a cutoff 1 minute ago (so our just-injected vuln counts).
-	res, err := RunSince(ctx, pool, time.Now().UTC().Add(-time.Minute))
+	res, err := RunForVulns(ctx, pool, []string{vulnID})
 	if err != nil {
-		t.Fatalf("continuity.RunSince: %v", err)
+		t.Fatalf("continuity.RunForVulns: %v", err)
 	}
 	t.Logf("continuity result: %+v", res)
 

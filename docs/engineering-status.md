@@ -129,24 +129,23 @@ finding (project, snapshot, purl, version, vuln_id, status, first/last_seen)
 This is the important section. The engine is correct, but "correct engine" ≠
 "practical product." These are ordered by practical impact.
 
-### FLAW 1 — No transitive resolution for ecosystems that need it [HIGH]
+### FLAW 1 — No transitive resolution for ecosystems that need it [HIGH] — ✅ FIXED (pip)
 
 We **only read lockfiles**. This is fine for npm and Cargo (lockfiles list the
-full transitive tree) but **dangerously incomplete** for:
+full transitive tree) but was **dangerously incomplete** for:
 
-- **pip with `requirements.txt`** — only direct deps are visible; the entire
-  transitive closure (where most real Python vulns live) is invisible. A
-  vulnerable `cryptography` pulled in transitively by `requests` is never matched.
-- **Maven** — not implemented at all; effective-POM/BOM resolution is the hardest
+- **pip with `requirements.txt`** — ✅ FIXED. `internal/resolver` now queries the
+  pypi.org JSON API to walk `requires_dist` via BFS, building the full transitive
+  closure. Picks the highest version satisfying the declared range (PEP 440),
+  skips pre-releases by default, skips optional (extra) deps. The pip parser now
+  captures version ranges instead of silently dropping them. Verified: 2 direct
+  deps → 9 transitive resolved → 16 findings including transitives urllib3 + idna.
+- **Maven** — ❌ still not implemented; effective-POM/BOM resolution is the hardest
   ecosystem (Phase 2).
-- **Go** — `go.sum` works but has fork/dedup edge cases; no `go mod graph`.
+- **Go** — `go.sum` gives the full closure (works correctly); `go.mod`-only is
+  still best-effort (no MVS), but rare in practice since go.sum is standard.
 
-**Impact:** For 2 of 4 "supported" ecosystems, we give an incomplete picture that
-can create **false confidence** — a security team thinking they're covered when
-they're not. This is worse than no answer.
-
-**Fix direction:** lockfile-less transitive resolution (invoke `pip`/`uv` resolve
-for pip; effective-POM resolver for Maven). Push lockfile adoption as the
+**Remaining:** Maven transitive resolution.
 preferred path. See design doc §6.2.
 
 ### FLAW 2 — Local matcher will scale-cliff at real volume [HIGH]

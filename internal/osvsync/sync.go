@@ -2,12 +2,12 @@ package osvsync
 
 import (
 	"archive/zip"
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -19,25 +19,56 @@ import (
 )
 
 const (
-	baseURL     = "https://osv-vulnerabilities.storage.googleapis.com"
-	httpTimeout = 10 * time.Minute // zips can be large
+	baseURL               = "https://osv-vulnerabilities.storage.googleapis.com"
+	httpTimeout           = 10 * time.Minute // zips can be large
+	maxArchiveBytes int64 = 1 << 30          // 1 GiB compressed archive safety limit
+)
+
+// Status is the terminal state of one ecosystem sync.
+type Status string
+
+const (
+	StatusComplete Status = "complete"
+	StatusSkipped  Status = "skipped"
+	StatusFailed   Status = "failed"
 )
 
 // Stats reports the outcome of one ecosystem sync.
 type Stats struct {
-	Ecosystem model.Ecosystem
-	Records   int  // number of records upserted
-	Skipped   bool // true if HEAD said unchanged
-	Bytes     int64
-	Duration  time.Duration
-	Err       error
+	Ecosystem    model.Ecosystem
+	Status       Status
+	Records      int      // number of advisory records successfully processed
+	ChangedVulns []string // exact IDs inserted or materially changed in this sync
+	Skipped      bool     // true if HEAD said unchanged
+	Bytes        int64
+	Duration     time.Duration
+	Err          error
 }
 
-// SyncResult aggregates per-ecosystem stats and the sync timestamp (for the
-// continuity flow's ChangedVulnsSince).
+// SyncResult aggregates per-ecosystem stats. ChangedVulnIDs is the exact
+// handoff from a completed sync to the continuity worker.
 type SyncResult struct {
 	StartedAt time.Time
 	Stats     []Stats
+}
+
+// ChangedVulnIDs returns the exact advisory IDs changed by successful
+// ecosystems in this sync. It is the handoff contract for continuity.
+func (r SyncResult) ChangedVulnIDs() []string {
+	seen := map[string]bool{}
+	var ids []string
+	for _, stat := range r.Stats {
+		if stat.Status != StatusComplete {
+			continue
+		}
+		for _, id := range stat.ChangedVulns {
+			if id != "" && !seen[id] {
+				seen[id] = true
+				ids = append(ids, id)
+			}
+		}
+	}
+	return ids
 }
 
 // Sync downloads + upserts the OSV data for the given ecosystems.
@@ -55,6 +86,7 @@ func Sync(ctx context.Context, pool *pgxpool.Pool, ecosystems []model.Ecosystem,
 		bucket, ok := bucketEcosystem(eco)
 		if !ok {
 			s.Err = fmt.Errorf("unsupported ecosystem %s", eco)
+			s.Status = StatusFailed
 			s.Duration = time.Since(start)
 			result.Stats = append(result.Stats, s)
 			continue
@@ -69,6 +101,7 @@ func Sync(ctx context.Context, pool *pgxpool.Pool, ecosystems []model.Ecosystem,
 				remoteLastMod = lm
 				if !changed {
 					s.Skipped = true
+					s.Status = StatusSkipped
 					s.Duration = time.Since(start)
 					result.Stats = append(result.Stats, s)
 					continue
@@ -79,8 +112,9 @@ func Sync(ctx context.Context, pool *pgxpool.Pool, ecosystems []model.Ecosystem,
 		}
 
 		// --- Download + stream-extract + upsert. ---
-		n, bytesN, err := downloadAndStore(ctx, st, eco, url)
+		n, changed, bytesN, err := downloadAndStore(ctx, st, eco, url)
 		s.Records = n
+		s.ChangedVulns = changed
 		s.Bytes = bytesN
 		s.Duration = time.Since(start)
 		s.Err = err
@@ -91,8 +125,15 @@ func Sync(ctx context.Context, pool *pgxpool.Pool, ecosystems []model.Ecosystem,
 				remoteLastMod, _ = headLastModified(ctx, url)
 			}
 			if remoteLastMod != "" {
-				_ = cache.setLastModified(ctx, eco, remoteLastMod)
+				if err := cache.setLastModified(ctx, eco, remoteLastMod); err != nil {
+					s.Err = fmt.Errorf("recording sync metadata: %w", err)
+				}
 			}
+		}
+		if s.Err != nil {
+			s.Status = StatusFailed
+		} else {
+			s.Status = StatusComplete
 		}
 		result.Stats = append(result.Stats, s)
 	}
@@ -130,39 +171,68 @@ func headLastModified(ctx context.Context, url string) (string, error) {
 	return resp.Header.Get("Last-Modified"), nil
 }
 
-// downloadAndStore GETs the zip, streams entries, parses each as an OSV record,
-// and upserts into vuln_record. Returns (records, bytes, err).
-// Streaming (not load-all) bounds memory for large ecosystems like npm.
-func downloadAndStore(ctx context.Context, st *store.Store, eco model.Ecosystem, url string) (int, int64, error) {
+// syncStore is the persistence contract needed while processing one archive.
+// It keeps the archive parser independently testable without a live Postgres DB.
+type syncStore interface {
+	BulkUpsertVulns(context.Context, []store.VulnRow) ([]string, error)
+	ReindexVulnPackages(context.Context, []string) error
+}
+
+// downloadAndStore GETs the zip, saves it to a temporary file, parses each OSV
+// record, and upserts it into vuln_record. ZIP readers require random access,
+// but the archive must not occupy RAM proportional to its size.
+func downloadAndStore(ctx context.Context, st *store.Store, eco model.Ecosystem, url string) (int, []string, int64, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return 0, 0, err
+		return 0, nil, 0, err
 	}
 	c := &http.Client{Timeout: httpTimeout}
 	resp, err := c.Do(req)
 	if err != nil {
-		return 0, 0, fmt.Errorf("GET %s: %w", url, err)
+		return 0, nil, 0, fmt.Errorf("GET %s: %w", url, err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return 0, 0, fmt.Errorf("GET %s: %d", url, resp.StatusCode)
+		return 0, nil, 0, fmt.Errorf("GET %s: %d", url, resp.StatusCode)
 	}
 
-	// Read the body into memory once. ZIP needs random access so we can't truly
-	// stream the HTTP body into the zip reader, but we use zip.NewReader over the
-	// buffer and process entries incrementally rather than decoding all JSONs
-	// into a slice first (the actual memory hog in osv-scanner #2217).
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<30)) // 1GB safety cap
+	archive, err := os.CreateTemp("", "amparo-osv-*.zip")
 	if err != nil {
-		return 0, 0, fmt.Errorf("reading zip: %w", err)
+		return 0, nil, 0, fmt.Errorf("creating temporary archive: %w", err)
 	}
-	zr, err := zip.NewReader(bytes.NewReader(body), int64(len(body)))
+	archivePath := archive.Name()
+	defer os.Remove(archivePath)
+
+	bytesN, err := io.Copy(archive, io.LimitReader(resp.Body, maxArchiveBytes+1))
+	if closeErr := archive.Close(); err == nil && closeErr != nil {
+		err = closeErr
+	}
 	if err != nil {
-		return 0, int64(len(body)), fmt.Errorf("opening zip: %w", err)
+		return 0, nil, bytesN, fmt.Errorf("saving zip: %w", err)
+	}
+	if bytesN > maxArchiveBytes {
+		return 0, nil, bytesN, fmt.Errorf("zip exceeds compressed size limit of %d bytes", maxArchiveBytes)
 	}
 
+	zr, err := zip.OpenReader(archivePath)
+	if err != nil {
+		return 0, nil, bytesN, fmt.Errorf("opening zip: %w", err)
+	}
+	defer zr.Close()
+
+	count, changed, err := storeArchive(ctx, st, eco, &zr.Reader)
+	if err != nil {
+		return count, changed, bytesN, err
+	}
+	return count, changed, bytesN, nil
+}
+
+// storeArchive validates and persists every advisory in an archive. A sync is
+// complete only if every entry and every persistence batch succeeds.
+func storeArchive(ctx context.Context, st syncStore, eco model.Ecosystem, zr *zip.Reader) (int, []string, error) {
 	bucket, _ := bucketEcosystem(eco)
 	count := 0
+	var changedVulns []string
 	// Buffer records and flush in batches via bulk COPY for speed. A per-record
 	// upsert would take many minutes for large ecosystems (npm has ~40k records).
 	const batchSize = 500
@@ -176,13 +246,16 @@ func downloadAndStore(ctx context.Context, st *store.Store, eco model.Ecosystem,
 		for i, r := range batch {
 			ids[i] = r.OSVID
 		}
-		if err := st.BulkUpsertVulns(ctx, batch); err != nil {
+		changed, err := st.BulkUpsertVulns(ctx, batch)
+		if err != nil {
 			return err
 		}
-		// Keep the normalized vuln_package index in sync so lookups are fast.
-		// Non-fatal: a failed reindex leaves the index slightly stale; the
-		// matcher falls back to whatever rows ARE indexed.
-		_ = st.ReindexVulnPackages(ctx, ids)
+		changedVulns = append(changedVulns, changed...)
+		// Local matching depends on this normalized index. Treat an indexing
+		// failure as a sync failure rather than claiming a partial DB is complete.
+		if err := st.ReindexVulnPackages(ctx, ids); err != nil {
+			return fmt.Errorf("reindexing vuln packages: %w", err)
+		}
 		count += len(batch)
 		batch = batch[:0]
 		return nil
@@ -194,23 +267,30 @@ func downloadAndStore(ctx context.Context, st *store.Store, eco model.Ecosystem,
 		}
 		rc, err := f.Open()
 		if err != nil {
-			continue
+			return count, changedVulns, fmt.Errorf("opening archive entry %q: %w", f.Name, err)
 		}
 		var vuln osvclient.Vulnerability
 		dec := json.NewDecoder(rc)
-		if err := dec.Decode(&vuln); err != nil {
-			rc.Close()
-			continue
+		decodeErr := dec.Decode(&vuln)
+		closeErr := rc.Close()
+		if decodeErr != nil {
+			return count, changedVulns, fmt.Errorf("decoding archive entry %q: %w", f.Name, decodeErr)
 		}
-		rc.Close()
+		if closeErr != nil {
+			return count, changedVulns, fmt.Errorf("closing archive entry %q: %w", f.Name, closeErr)
+		}
 
 		batch = append(batch, vulnToRow(bucket, &vuln))
 		if len(batch) >= batchSize {
-			_ = flush() // a failed batch is logged but doesn't abort the whole sync
+			if err := flush(); err != nil {
+				return count, changedVulns, fmt.Errorf("persisting archive batch: %w", err)
+			}
 		}
 	}
-	_ = flush() // final partial batch
-	return count, int64(len(body)), nil
+	if err := flush(); err != nil {
+		return count, changedVulns, fmt.Errorf("persisting final archive batch: %w", err)
+	}
+	return count, changedVulns, nil
 }
 
 // vulnToRow converts an OSV Vulnerability into a VulnRow for bulk storage.

@@ -14,7 +14,19 @@ import (
 // Report is the full output of a scan.
 type Report struct {
 	Summary  Summary         `json:"summary"`
+	Coverage Coverage        `json:"coverage"`
 	Findings []model.Finding `json:"findings"`
+}
+
+// Coverage records whether a scan successfully parsed every supported lockfile
+// it discovered. It is populated by the scan pipeline; reports created from
+// persisted findings leave Discovered at zero because no source was scanned.
+type Coverage struct {
+	Complete   bool     `json:"complete"`
+	Discovered int      `json:"discovered"`
+	Parsed     int      `json:"parsed"`
+	Failed     int      `json:"failed"`
+	Warnings   []string `json:"warnings,omitempty"`
 }
 
 // Summary aggregates finding counts by priority.
@@ -62,7 +74,7 @@ func Build(findings []model.Finding, depCount int) Report {
 	sort.SliceStable(findings, func(i, j int) bool {
 		return rankP(findings[i].Priority) > rankP(findings[j].Priority)
 	})
-	return Report{Summary: s, Findings: findings}
+	return Report{Summary: s, Coverage: Coverage{Complete: true}, Findings: findings}
 }
 
 func rankP(s model.Severity) int {
@@ -94,6 +106,16 @@ func WriteText(w io.Writer, r Report) error {
 	fmt.Fprintf(w, "  SCA Scan Results\n")
 	fmt.Fprintf(w, "  %s\n", strings.Repeat("─", 50))
 	fmt.Fprintf(w, "  Dependencies scanned : %d\n", s.Dependencies)
+	if r.Coverage.Discovered > 0 {
+		if r.Coverage.Complete {
+			fmt.Fprintf(w, "  Lockfile coverage    : complete (%d/%d parsed)\n", r.Coverage.Parsed, r.Coverage.Discovered)
+		} else {
+			fmt.Fprintf(w, "  Lockfile coverage    : INCOMPLETE (%d/%d parsed; %d failed)\n", r.Coverage.Parsed, r.Coverage.Discovered, r.Coverage.Failed)
+			for _, warning := range r.Coverage.Warnings {
+				fmt.Fprintf(w, "  warning: %s\n", warning)
+			}
+		}
+	}
 	fmt.Fprintf(w, "  Vulnerable findings  : %d", s.Total)
 	if s.Total > 0 {
 		fmt.Fprintf(w, "  (")

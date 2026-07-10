@@ -63,6 +63,20 @@ Given a lockfile (or a directory of them), Amparo:
 > real data, but it is not yet a complete product — see
 > [Project status](#-project-status--known-limitations).
 
+## 🛡️ Trustworthiness guarantees
+
+The scanner is evolving toward these non-negotiable guarantees:
+
+- A sync reported as **complete** has persisted and indexed every advisory it
+  processed; a storage, indexing, or advisory-decoding error makes that
+  ecosystem sync fail rather than silently returning partial data.
+- A scan must disclose incomplete coverage when a supported discovered lockfile
+  cannot be read or parsed. `amparo scan --strict` makes incomplete coverage
+  fatal for CI and automation.
+- Continuity receives the exact advisory IDs inserted or materially changed by
+  a successful sync, so newly imported historical advisories surface for
+  existing snapshots without a source rescan.
+
 ---
 
 ## 🔁 The continuity differentiator
@@ -83,8 +97,8 @@ Most SCA tools scan on commit and forget. Amparo is built for **continuity**:
 
 Because matching is a **pure function of `(dependency, DB state)`**, a freshly
 synced advisory surfaces on previously-scanned code automatically. `amparo sync`
-keeps the local DB fresh; the continuity invariant (re-matching is idempotent,
-changes are tracked via `ChangedVulnsSince`) is verified by test.
+keeps the local DB fresh; completed syncs hand exact changed advisory IDs to
+continuity, and the re-match is verified to be idempotent.
 
 ---
 
