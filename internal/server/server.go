@@ -52,6 +52,7 @@ func (s *Server) routes() {
 	mux.HandleFunc("/api/v1/projects/", s.handleProjectByName) // /projects/{name}[/findings]
 	mux.HandleFunc("/api/v1/findings/", s.handleFindingByID)   // /findings/{id}
 	mux.HandleFunc("/api/v1/summary", s.handleSummary)
+	mux.HandleFunc("/api/v1/webhooks/github", s.handleGitHubWebhook) // GitHub push/PR intake
 }
 
 // Handler returns the CORS-wrapped mux suitable for http.ServeMux.
