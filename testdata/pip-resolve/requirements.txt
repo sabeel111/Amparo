@@ -1,0 +1,3 @@
+# Old vulnerable versions to prove resolution + matching works end to end
+django>=3.2,<3.3
+requests>=2.27,<2.28

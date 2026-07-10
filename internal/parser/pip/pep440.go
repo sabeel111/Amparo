@@ -159,7 +159,13 @@ func parseTail(tail string) (pre *preRelease, post *int, dev *int) {
 			kind = "b"
 		}
 		if kind != "" {
-			rest := tail[len(kind):]
+			// Bounds-check: kind may be longer than tail in malformed inputs.
+			var rest string
+			if len(kind) <= len(tail) {
+				rest = tail[len(kind):]
+			} else {
+				rest = ""
+			}
 			rest = strings.TrimLeft(rest, ".-")
 			n := 0
 			if num, err := strconv.Atoi(grabDigits(rest)); err == nil {
@@ -307,7 +313,24 @@ func comparePost(a, b *int) int {
 	return 0
 }
 
-// ComparePipVersions is the exported comparator used by remediation.
-func ComparePipVersions(a, b string) int {
+// ComparePipVersions is the exported comparator used by remediation and the
+// resolver. It's called on ARBITRARY external version strings (from pypi release
+// lists, OSV records, lockfiles) so it must never panic — a single malformed
+// version shouldn't crash the whole scanner. On panic it falls back to
+// lexicographic comparison, which is wrong-but-safe (better than a crash).
+func ComparePipVersions(a, b string) (result int) {
+	defer func() {
+		if r := recover(); r != nil {
+			// Malformed version that our PEP 440 parser can't handle. Fall back
+			// to a naive string compare so we never crash the scanner.
+			if a < b {
+				result = -1
+			} else if a > b {
+				result = 1
+			} else {
+				result = 0
+			}
+		}
+	}()
 	return comparePEP440(parsePEP440(a), parsePEP440(b))
 }
