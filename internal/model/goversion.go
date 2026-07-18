@@ -3,46 +3,56 @@ package model
 import (
 	"strconv"
 	"strings"
+
+	"golang.org/x/mod/semver"
 )
 
 // CompareGoVersions compares Go module versions, including pseudo-versions.
 //
-// Go module versions come in two forms:
-//  1. Canonical semver: "v1.2.3", "v1.2.3-beta", "v2.0.0".
-//  2. Pseudo-versions: "v0.0.0-20240102120000-abcdef1234ab" (for commits without
-//     a tag), "v1.2.4-pre0.20240102120000-abcdef1234ab" (pre-release + commit).
+// Delegates to golang.org/x/mod/semver — the official Go team's implementation
+// used by the `go` command itself and by osv-scanner. It handles canonical
+// semver (v1.2.3), pre-releases (v1.2.3-beta), AND pseudo-versions
+// (v0.0.0-20240102120000-abcdef1234ab) natively, including the subtle ordering
+// rules around pseudo-versions and tagged releases.
 //
-// The pseudo-version embeds a UTC timestamp (YYYYMMDDhhmmss) and a commit hash.
-// Ordering: a higher timestamp = a later version. Pseudo-versions sort AFTER
-// their base semver but BEFORE the next tagged release.
+// Requires the leading "v" prefix (Go convention); we add it if missing.
 //
 // Returns -1 if a < b, 0 if equal, 1 if a > b.
 func CompareGoVersions(a, b string) int {
-	// Strip leading 'v' (Go versions always start with v, semver comparison
-	// doesn't expect it).
+	a = ensureVPrefix(a)
+	b = ensureVPrefix(b)
+	return semver.Compare(a, b)
+}
+
+// ensureVPrefix adds the "v" prefix if missing (golang.org/x/mod/semver requires it).
+func ensureVPrefix(v string) string {
+	v = strings.TrimSpace(v)
+	if !strings.HasPrefix(v, "v") {
+		return "v" + v
+	}
+	return v
+}
+
+// (Legacy helpers below retained for reference/tests but no longer on the hot path
+// now that we delegate to golang.org/x/mod/semver. If the legacy comparators are
+// not referenced elsewhere, they can be removed in a follow-up cleanup.)
+
+// CompareGoVersionsLegacy is the previous hand-rolled implementation, kept for
+// reference and regression comparison. Not used in production.
+func CompareGoVersionsLegacy(a, b string) int {
 	a = strings.TrimPrefix(a, "v")
 	b = strings.TrimPrefix(b, "v")
-
-	// Extract pseudo-version timestamp if present.
 	coreA, tsA, hashA := splitPseudo(a)
 	coreB, tsB, hashB := splitPseudo(b)
-
-	// Compare the semver cores first.
 	if c := CompareVersions(coreA, coreB); c != 0 {
 		return c
 	}
-
-	// Same core. If both are pseudo-versions, order by timestamp (then hash).
 	if tsA != "" && tsB != "" {
 		if tsA != tsB {
-			return strings.Compare(tsA, tsB) // lexicographic works for same-format timestamps
+			return strings.Compare(tsA, tsB)
 		}
 		return strings.Compare(hashA, hashB)
 	}
-	// A pseudo-version is GREATER than its bare core (the core tag came first,
-	// the pseudo-version is a later commit). e.g. v1.2.3 < v1.2.4-0... wait:
-	// actually v1.2.3-0.timestamp is BEFORE v1.2.4 but AFTER v1.2.3-pre? The Go
-	// spec: pseudo-version after .preN sort. Simplify: pseudo > tagged core.
 	if tsA != "" {
 		return 1
 	}

@@ -3,6 +3,8 @@ package pipparser
 import (
 	"strconv"
 	"strings"
+
+	pep440version "github.com/aquasecurity/go-pep440-version"
 )
 
 // This file implements a pragmatic PEP 440 version parser and comparator.
@@ -313,16 +315,34 @@ func comparePost(a, b *int) int {
 	return 0
 }
 
-// ComparePipVersions is the exported comparator used by remediation and the
-// resolver. It's called on ARBITRARY external version strings (from pypi release
-// lists, OSV records, lockfiles) so it must never panic — a single malformed
-// version shouldn't crash the whole scanner. On panic it falls back to
-// lexicographic comparison, which is wrong-but-safe (better than a crash).
-func ComparePipVersions(a, b string) (result int) {
+// ComparePipVersions is the exported PEP 440 comparator used by remediation,
+// matching, and the resolver.
+//
+// Delegates to aquasecurity/go-pep440-version — Aqua Security's spec-faithful
+// PEP 440 implementation (the same one Trivy uses). Handles epochs, post/dev/
+// local releases, and pre-release ordering correctly. This replaces our previous
+// hand-rolled parser, which panicked on edge cases like "6.1b1" and required a
+// recover() hack that fell back to wrong lexicographic ordering.
+//
+// The library returns an error (not a panic) for unparseable strings; in that
+// case we fall back to pragmatic numeric comparison — better to produce a
+// best-effort answer than to crash, but this path should be rare.
+func ComparePipVersions(a, b string) int {
+	va, errA := pep440version.Parse(a)
+	vb, errB := pep440version.Parse(b)
+	if errA == nil && errB == nil {
+		return va.Compare(vb)
+	}
+	// Fallback: one or both versions are non-PEP440. Use pragmatic comparison.
+	return ComparePipVersionsLegacy(a, b)
+}
+
+// ComparePipVersionsLegacy is the previous hand-rolled implementation, retained
+// as the fallback for non-PEP440 strings and for regression comparison. Not
+// used on the main path now that we delegate to go-pep440-version.
+func ComparePipVersionsLegacy(a, b string) (result int) {
 	defer func() {
 		if r := recover(); r != nil {
-			// Malformed version that our PEP 440 parser can't handle. Fall back
-			// to a naive string compare so we never crash the scanner.
 			if a < b {
 				result = -1
 			} else if a > b {

@@ -3,18 +3,42 @@ package model
 import (
 	"strconv"
 	"strings"
+
+	"github.com/Masterminds/semver/v3"
 )
 
-// CompareVersions compares two versions using semver-like ordering.
+// CompareVersions compares two versions.
 //
-// This is a pragmatic comparator for the MVP. It handles dotted numeric versions
-// (1.2.3 vs 1.2.4), pre-release tags (1.0.0-alpha < 1.0.0), and the Maven "soft
-// zero" rule (1 == 1.0 == 1.0.0) by padding to equal length. It is NOT a full
-// implementation of semver, PEP 440, or Maven version ordering — for those,
-// ecosystem-specific comparators (see internal/parser/pip for PEP 440) are used.
+// For strict SemVer inputs (npm, Cargo) it delegates to Masterminds/semver — a
+// spec-compliant implementation that handles pre-release ordering
+// (1.0.0-alpha < 1.0.0-beta < 1.0.0) and ignores build metadata per the SemVer
+// spec. For non-SemVer inputs (Maven soft-zero like "1" == "1.0.0", loose
+// versions), it falls back to a pragmatic numeric/lexicographic comparator.
 //
 // Returns -1 if a < b, 0 if a == b, 1 if a > b.
 func CompareVersions(a, b string) int {
+	// Fast path: try strict SemVer for both. This covers npm/Cargo cleanly.
+	if va, errA := semver.NewVersion(sanitizeSemver(a)); errA == nil {
+		if vb, errB := semver.NewVersion(sanitizeSemver(b)); errB == nil {
+			return va.Compare(vb)
+		}
+	}
+	// Fallback: pragmatic comparator for non-semver strings (Maven, loose).
+	return comparePragmatic(a, b)
+}
+
+// sanitizeSemver strips a leading 'v' (npm often uses v1.2.3) and tolerates the
+// "v" prefix Masterminds accepts but doesn't require. We add 'v' tolerance by
+// letting Masterminds handle it (it accepts both forms).
+func sanitizeSemver(v string) string {
+	// Masterminds accepts "1.2.3" and "v1.2.3" natively; no transformation needed.
+	return strings.TrimSpace(v)
+}
+
+// comparePragmatic is the legacy comparator, retained for non-SemVer version
+// strings (Maven "soft zero", loose versions). Handles dotted numeric versions
+// and pre-release suffixes; pads to equal length so 1 == 1.0 == 1.0.0.
+func comparePragmatic(a, b string) int {
 	ra, preA := splitPreRelease(a)
 	rb, preB := splitPreRelease(b)
 	pa := strings.Split(strings.Trim(ra, "."), ".")
