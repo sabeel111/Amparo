@@ -88,7 +88,7 @@ Lockfile → Parser (per-ecosystem) → []Dependency
 
 | Package | Responsibility | Phase |
 |---------|----------------|-------|
-| `internal/model` | Domain types + version comparators (semver, PEP 440, Go pseudo) | 0+1 |
+| `internal/model` | Domain types + version comparators (npm/Cargo via Masterminds/semver, Go via golang.org/x/mod/semver, PyPI via aquasecurity/go-pep440-version) | 0+1 |
 | `internal/parser` | Parser registry + auto-detection | 0 |
 | `internal/parser/{npm,pip}` | npm + pip lockfile parsers | 0 |
 | `internal/parser/{go,cargo}` | Go + Cargo lockfile parsers | 1 |
@@ -115,11 +115,24 @@ finding (project, snapshot, purl, version, vuln_id, status, first/last_seen)
 ### Verified facts
 
 - CVSS calculator matches NVD authoritative scores (test: `TestScoreFromVector`).
+- **Version comparators are spec-compliant libraries, not hand-rolled** (2026-07-10):
+  npm/Cargo → `Masterminds/semver`, Go → `golang.org/x/mod/semver` (the Go team's
+  own, used by osv-scanner), PyPI → `aquasecurity/go-pep440-version` (Trivy's lib).
+  The previous hand-rolled PEP 440 comparator panicked on edge cases like `6.1b1`
+  and required a `recover()` hack that silently produced wrong lexicographic
+  ordering — now retired. See `engineering_flaws_codex.md` P0 entry.
 - Live and local matchers return identical findings for the same input
   (test: `TestLocalVsLiveCrossCheck` — 22/22 vulns for golang.org/x/crypto).
 - Continuity invariant: re-matching is idempotent; `ChangedVulnsSince` tracks
   DB updates (test: `TestContinuity_FlowB`).
+- Continuity enrichment parity: a continuity-discovered finding now carries the
+  same composite priority, EPSS, actionability, and remediation as a scan-
+  discovered one (both call `scan.EnrichFindings`). Test:
+  `TestContinuity_SurfacesNewFindingWithoutRescan` asserts `priority='critical'`
+  and `actionable='actionable_now'`.
 - Finding dedup works across rescans (test: `TestUpsertFinding_DedupBumpsLastSeen`).
+- Cross-source advisory dedup collapses "Duplicate Advisory" records that lack
+  alias links via summary-text matching (test: `TestDedupeFindings_DupAdvisoryWithoutAliases`).
 - OSV sync: Go = 8,041 records in ~5s; npm = 221,844 records in ~15min.
 
 ---

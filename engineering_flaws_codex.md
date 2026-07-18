@@ -64,7 +64,7 @@ have migrated their repositories and automation.
 
 ## Remaining flaws, ordered by core risk
 
-## P0 — Version comparison can produce false positives or false negatives
+## P0 — Version comparison can produce false positives or false negatives — PARTIALLY MITIGATED (libraries swapped; corpus pending)
 
 **Where:** `internal/model/version.go`, `internal/model/goversion.go`, and
 `internal/parser/pip/pep440.go`.
@@ -73,29 +73,35 @@ have migrated their repositories and automation.
 `installed < fixed` or `introduced <= installed` is evaluated incorrectly, the
 tracker can incorrectly claim a dependency is safe or vulnerable.
 
-**Current issue:**
+**Status (2026-07-10): The three hand-rolled comparators have been replaced with
+battle-tested, spec-compliant libraries.** Same public API at every call site;
+only the internals changed.
 
-- The generic comparator is explicitly pragmatic, not full SemVer or Maven.
-- Build metadata and complex prerelease ordering are not fully SemVer-correct.
-- Go pseudo-version handling does not cover all canonical pseudo-version forms.
-- The PEP 440 implementation is intentionally partial and has limited test
-  coverage for epochs, local versions, dev/post releases, and compound cases.
+| Ecosystem | Library | Notes |
+|-----------|---------|-------|
+| npm/Cargo (SemVer) | `Masterminds/semver/v3` | Strict spec — correct pre-release ordering (`1.0.0-alpha < 1.0.0-beta < 1.0.0`), build metadata ignored for ordering. Falls back to pragmatic comparator for non-semver strings (Maven soft-zero). |
+| Go | `golang.org/x/mod/semver` | The Go team's official package — used by the `go` command and by osv-scanner. Handles pseudo-versions (`v0.0.0-20240102-abcdef`) natively. |
+| PyPI (PEP 440) | `aquasecurity/go-pep440-version` | Aqua Security's spec-faithful port (same lib Trivy uses). Handles epochs, post/dev/local, pre-release ordering. **Retires the `recover()` panic hack** that silently produced wrong lexicographic ordering on edge cases like `6.1b1`. |
 
-**Mitigation plan:**
+Principle applied: don't hand-roll what mature projects have already debugged.
+Legacy implementations retained as `...Legacy` functions for fallback and
+regression comparison. All existing tests pass unchanged; the pip resolver
+re-scan (which previously panicked on `6.1b1`) runs clean.
 
-1. Define a comparator contract per supported ecosystem; do not use one generic
-   comparator where semantics differ.
-2. Adopt a maintained Go SemVer/Go-module implementation where possible, or
-   validate a local implementation against the ecosystem's official corpus.
-3. Expand PEP 440 tests using packaging's reference cases and real OSV ranges.
-4. Add table-driven boundary tests for every comparator: introduced, fixed,
-   last_affected, prerelease, build metadata, pseudo-version, epoch, post, and
-   dev release.
-5. Add a cross-check corpus: dependency + OSV range + expected result, executed
-   by both live and local matchers.
+**Remaining work (the corpus — still open):**
 
-**Acceptance criteria:** Every supported ecosystem has authoritative edge-case
-tests, and live/local matcher results remain equal for the same corpus.
+1. Build a curated cross-check corpus: `(dependency, OSV range, expected result)`
+   triples, including edge cases (pre-releases, build metadata, pseudo-versions,
+   epochs, post/dev, boundary versions).
+2. One test that runs the corpus through BOTH the live OSV matcher AND the local
+   DB matcher, asserting they agree on every case. This is the permanent
+   regression gate — catches comparator drift, matcher divergence, and any
+   future wiring bug in one shot.
+3. Expand PEP 440 / SemVer corpus using each ecosystem's official reference cases.
+
+**Acceptance criteria (updated):** Library swap is done (this section). Cross-
+check corpus remains open — when landed, live and local matcher results must be
+equal for every corpus case, and the corpus covers each ecosystem's edge cases.
 
 ## P0 — Continuity does not run the full risk-enrichment pipeline
 
