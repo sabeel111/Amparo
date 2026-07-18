@@ -150,20 +150,87 @@ missing.
 
 ## P1 — OSV synchronization remains operationally expensive
 
-**Where:** `internal/osvsync/sync.go`.
+**Where:** `internal/osvsync/sync.go`, `internal/continuity/continuity.go`.
 
 **Current state:** Archive RAM usage and silent errors were fixed, but npm and
 other ecosystems still require a full archive download when `Last-Modified`
 changes. The archive is then fully reprocessed.
 
-**Mitigation plan:** Investigate OSV's per-file/delta metadata. Persist
-per-record source version or last-modified metadata, fetch only changed records,
-and retain exact changed-ID handoff. Add per-entry uncompressed-size and total
-extraction limits to protect against malicious or corrupted archives.
+There are two layered issues here — a tactical bandwidth problem and a deeper
+architectural one. Both are deferred for now; this note captures the analysis
+so we don't re-derive it later.
+
+### Issue A — Whole-archive re-download on any change (tactical, bandwidth)
+
+Today, when OSV changes a single advisory anywhere in npm, Amparo re-downloads
+the entire `npm/all.zip` (≈200MB, 221k records) and re-upserts all of them.
+The HEAD-first `Last-Modified` check correctly skips when nothing changed, but
+*any* change triggers a full re-download. The `BulkUpsertVulns` exact-changed-ID
+handoff (added in the Codex pass) means unchanged records no longer flow into
+continuity — but they are still downloaded and re-processed for the upsert.
+
+**Mitigation plan:** Replace the single `all.zip` GET with GCS bucket
+enumeration (`?prefix=<eco>/&max-keys=1000`, paginated) comparing each
+`<VULN_ID>.json` file's `Last-Modified`/ETag against stored per-record metadata,
+fetching only changed files. Same pattern as `git fetch` vs `git clone` — pull
+the diff, not the whole repo. Add per-entry uncompressed-size and total
+extraction limits to protect against malicious/corrupted archives.
 
 **Acceptance criteria:** A small upstream delta does not require processing the
 entire npm corpus, and sync metrics expose bytes downloaded, records processed,
 records changed, and duration.
+
+**When to fix:** Becomes load-bearing when we target sub-hour freshness SLAs
+(design doc targets <30min). At daily-sync cadence, 200MB once a day is
+operationally fine — this is an optimization, not correctness.
+
+### Issue B — Continuity is coupled to the DB write path (architectural)
+
+The deeper insight (raised in design review): continuity does not strictly need
+the advisory to be *stored in Postgres* before re-matching. The continuity
+operation is:
+
+```
+changed advisory  ⨝  stored dependency snapshots  →  affected findings
+```
+
+The dependency snapshots live in Postgres, but the advisory only needs to be
+*available at match time* — it doesn't need to be persisted to do the join.
+The current design routes every changed advisory through
+`download → bulk-upsert → reindex → query-store → match`, which is double work
+for the continuity hot path: the upsert+reindex exists to serve *scans*, not
+*continuity*.
+
+The current single-mechanism approach (one DB serves both scan cache and
+continuity source) was a reasonable MVP simplification, but it conflates two
+distinct needs:
+
+- **Scan cache** — needs ALL advisories, persisted, queryable by package name.
+  Strong reason to store. Without it, every scan hits the live OSV API
+  (no offline, no scale, back to Dependabot-land).
+- **Continuity trigger** — needs only CHANGED advisories, transiently. Does NOT
+  need persistence. Could be event-driven: "OSV changed this advisory → here it
+  is in memory → match against snapshots → done."
+
+**Mitigation plan (deferred):** Decouple the two paths. Continuity takes an
+in-memory advisory and re-matches immediately, skipping the DB round-trip
+entirely in the hot path. The DB still gets populated as the scan cache, but on
+a slower cadence (e.g. nightly full sync), independent of the continuity loop.
+This makes continuity genuinely event-driven and removes the bulk-upsert from
+the per-advisory path.
+
+**Tradeoff to name explicitly before implementing:** This adds a second
+mechanism (in-memory re-match) alongside the DB, with the complexity of keeping
+them consistent (e.g. a continuity re-match that fires before the DB is updated
+must not double-report once the DB upsert lands). The MVP-correct choice was to
+use one mechanism; the scale-correct choice is to split them. Decide when
+continuity volume justifies it.
+
+**Auditability note:** Persisting advisories also lets us answer "what did we
+know about CVE-X as of July 1st?" (SOC2/EU CRA ask this). An in-memory-only
+advisory is gone after restart. This doesn't block Issue B's fix — the scan
+cache DB still persists advisories for this reason — but it's why we wouldn't
+go fully stateless on advisories.
 
 ## P1 — Parser support and documentation overstate coverage
 
